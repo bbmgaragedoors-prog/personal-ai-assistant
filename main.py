@@ -1,24 +1,23 @@
 import logging
-import signal
-import sys
-from flask import Flask, request, Response
-from config import FLASK_SECRET_KEY, PORT, DEBUG
+import json
+import os
+from flask import Flask, request, jsonify
+from config import FLASK_SECRET_KEY, FLASK_HOST, FLASK_PORT, DEBUG
 from assistant import PersonalAssistant
 from whatsapp_handler import WhatsAppHandler
+from reminder_manager import ReminderManager
 from email_manager import EmailManager
 from calendar_manager import CalendarManager
 from task_manager import TaskManager
-from web_search import WebSearch
-from reminder_manager import ReminderManager
 
 # Configure logging
 logging.basicConfig(
-      level=logging.INFO,
-      format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-      handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler("assistant.log")
-      ]
+          level=logging.INFO,
+          format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+          handlers=[
+                        logging.FileHandler('assistant.log'),
+                        logging.StreamHandler()
+          ]
 )
 logger = logging.getLogger(__name__)
 
@@ -26,115 +25,131 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
-# Initialize all components
-logger.info("Initializing Personal AI Assistant...")
+ENV_RAILWAY_URL = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 
-try:
-      whatsapp = WhatsAppHandler()
-      logger.info("WhatsApp handler ready")
-except Exception as e:
-      logger.error(f"WhatsApp init failed: {e}")
-      whatsapp = None
+# Initialize components
+logger.info("Initializing Personal AI Assistant components...")
 
-try:
-      email_mgr = EmailManager()
-      logger.info("Email manager ready")
-except Exception as e:
-      logger.warning(f"Email manager init failed (will retry on use): {e}")
-      email_mgr = None
+assistant = PersonalAssistant()
+whatsapp = WhatsAppHandler()
+reminder_mgr = ReminderManager(whatsapp)
 
-try:
-      calendar_mgr = CalendarManager()
-      logger.info("Calendar manager ready")
-except Exception as e:
-      logger.warning(f"Calendar manager init failed: {e}")
-      calendar_mgr = None
+@app.route('/health', methods=['GET'])
+def health_check():
+          return jsonify({'status': 'healthy', 'service': 'Personal AI Assistant'}), 200
 
-task_mgr = TaskManager()
-web_search = WebSearch()
-
-try:
-      reminder_mgr = ReminderManager(whatsapp_handler=whatsapp)
-      logger.info("Reminder manager ready")
-except Exception as e:
-      logger.warning(f"Reminder manager init failed: {e}")
-      reminder_mgr = None
-
-# Initialize the core assistant
-assistant = PersonalAssistant(
-      email_manager=email_mgr,
-      calendar_manager=calendar_mgr,
-      task_manager=task_mgr,
-      web_search=web_search,
-      reminder_manager=reminder_mgr,
-      whatsapp_handler=whatsapp
-)
-logger.info("Personal AI Assistant initialized and ready!")
-
-
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
-      """
-          Twilio WhatsApp webhook endpoint.
-              Receives incoming WhatsApp messages and returns a TwiML response.
-                  """
-      from_number = request.form.get("From", "")
-      body = request.form.get("Body", "").strip()
+          try:
+                        incoming_msg = request.values.get('Body', '').strip()
+                        from_number = request.values.get('From', '')
 
-    logger.info(f"Incoming WhatsApp from {from_number}: {body[:80]}")
+              if not whatsapp.is_owner(from_number):
+                                logger.warning(f"Unauthorized access attempt from {from_number}")
+                                return '', 403
 
-    if not body:
-              return Response(whatsapp.create_twiml_response("Please send a text message."),
-                                                      mimetype="application/xml")
+        logger.info(f"Received message from owner: {incoming_msg[:50]}...")
 
-    # Process through the assistant (security check inside)
-    if whatsapp:
-              response_text = whatsapp.process_incoming(from_number, body, assistant)
+        response_text = assistant.process_message(incoming_msg, from_number)
+
+        success = whatsapp.send_message(whatsapp.owner_number, response_text)
+        if not success:
+                          logger.error("Failed to send response via WhatsApp")
+
+        return '', 200
+
+except Exception as e:
+        logger.error(f"Error in webhook: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/send_whatsapp', methods=['POST'])
+def send_whatsapp():
+          try:
+                        data = request.json
+                        to_number = data.get('to')
+                        message = data.get('message')
+                        confirmed = data.get('confirmed', False)
+
+        if not to_number or not message:
+                          return jsonify({'error': 'Missing to or message'}), 400
+
+        if not confirmed:
+                          return jsonify({
+                                                'requires_confirmation': True,
+                                                'message': f'Send message to {to_number}?',
+                                                'preview': message
+                          }), 200
+
+        success = whatsapp.send_message(to_number, message)
+        if success:
+                          return jsonify({'status': 'sent'}), 200
 else:
-          response_text = assistant.process_message(body)
+            return jsonify({'error': 'Failed to send'}), 500
 
-    if not response_text:
-              # Message from unknown number - no response
-              return Response("", mimetype="application/xml")
+except Exception as e:
+        logger.error(f"Error sending WhatsApp: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
-    twiml = whatsapp.create_twiml_response(response_text)
-    return Response(twiml, mimetype="application/xml")
+@app.route('/oauth2callback', methods=['GET'])
+def oauth2callback():
+          try:
+                        from google_auth_oauthlib.flow import Flow
+                        from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SCOPES
 
+        flow = Flow.from_client_secrets_file(
+                          GOOGLE_CREDENTIALS_FILE,
+                          scopes=GOOGLE_SCOPES,
+                          redirect_uri=request.base_url
+        )
+        flow.fetch_token(authorization_response=request.url)
+        credentials = flow.credentials
 
-@app.route("/health", methods=["GET"])
-def health():
-      """Health check endpoint."""
-      return {
-          "status": "ok",
-          "components": {
-              "whatsapp": whatsapp is not None,
-              "email": email_mgr is not None,
-              "calendar": calendar_mgr is not None,
-              "tasks": True,
-              "web_search": True,
-              "reminders": reminder_mgr is not None
-          }
-      }
+        token_data = {
+                          'token': credentials.token,
+                          'refresh_token': credentials.refresh_token,
+                          'token_uri': credentials.token_uri,
+                          'client_id': credentials.client_id,
+                          'client_secret': credentials.client_secret,
+                          'scopes': list(credentials.scopes) if credentials.scopes else []
+        }
 
+        with open('google_token.json', 'w') as f:
+                          json.dump(token_data, f)
 
-@app.route("/", methods=["GET"])
-def index():
-      return "Personal AI Assistant is running. Send messages via WhatsApp."
+        logger.info("Google OAuth2 credentials saved successfully")
+        return 'Google authentication successful! You can close this window.', 200
 
+except Exception as e:
+        logger.error(f"OAuth callback error: {e}", exc_info=True)
+        return f'Authentication error: {str(e)}', 500
 
-def handle_shutdown(sig, frame):
-      """Graceful shutdown."""
-      logger.info("Shutting down...")
-      if reminder_mgr:
-                reminder_mgr.shutdown()
-            sys.exit(0)
+@app.route('/authorize_google', methods=['GET'])
+def authorize_google():
+          try:
+                        from google_auth_oauthlib.flow import Flow
+                        from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SCOPES
 
+        if ENV_RAILWAY_URL:
+                          redirect_uri = f"https://{ENV_RAILWAY_URL}/oauth2callback"
+else:
+            redirect_uri = request.host_url.rstrip('/') + '/oauth2callback'
 
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
+        flow = Flow.from_client_secrets_file(
+                          GOOGLE_CREDENTIALS_FILE,
+                          scopes=GOOGLE_SCOPES,
+                          redirect_uri=redirect_uri
+        )
+        authorization_url, state = flow.authorization_url(
+                          access_type='offline',
+                          include_granted_scopes='true'
+        )
+        return jsonify({'authorization_url': authorization_url}), 200
 
+except Exception as e:
+        logger.error(f"Error creating auth URL: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
-if __name__ == "__main__":
-      logger.info(f"Starting Flask server on port {PORT}")
-    logger.info("Set your Twilio webhook URL to: https://YOUR_DOMAIN/webhook")
-    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
+if __name__ == '__main__':
+          logger.info(f"Starting Personal AI Assistant on {FLASK_HOST}:{FLASK_PORT}")
+    reminder_mgr.start()
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=DEBUG)
